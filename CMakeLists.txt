@@ -65,3 +65,6 @@ idf_build_set_property(C_COMPILE_OPTIONS "-Os" APPEND)
 # For RISCV chips, project_include.cmake sets -Wno-format, but does not clear various
 # flags that depend on -Wformat
 idf_build_set_property(COMPILE_OPTIONS "-Wno-format-nonliteral;-Wno-format-security" APPEND)
+
+# Workaround for GCC 14.2 compatibility issues with Matter SDK
+idf_build_set_property(COMPILE_OPTIONS "-Wno-error" APPEND)

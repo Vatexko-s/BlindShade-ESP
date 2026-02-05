@@ -6,3 +6,4 @@ if (CONFIG_ENABLE_SET_CERT_DECLARATION_API)
 endif()
 
 target_compile_options(${COMPONENT_LIB} PRIVATE "-DCHIP_HAVE_CONFIG_H")
+target_compile_options(${COMPONENT_LIB} PRIVATE "-Wno-error=unused-function")
