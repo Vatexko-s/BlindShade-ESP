@@ -14,6 +14,9 @@
 #include <freertos/task.h>
 
 #include <driver/gpio.h>
+#include <esp_adc/adc_cali.h>
+#include <esp_adc/adc_cali_scheme.h>
+#include <esp_adc/adc_oneshot.h>
 #include <esp_rom_sys.h>
 #include <esp_timer.h>
 #include <nvs_flash.h>
@@ -54,6 +57,20 @@ constexpr uint32_t k_double_press_ms = 1000;
 constexpr uint32_t k_calib_timeout_ms = 300000;  // 5 minutes
 constexpr uint16_t k_min_travel_steps = 100;
 
+// === BATTERY ADC CONFIG ===
+constexpr gpio_num_t k_battery_adc_gpio = GPIO_NUM_0;
+constexpr adc_unit_t k_battery_adc_unit = ADC_UNIT_1;
+constexpr adc_channel_t k_battery_adc_channel = ADC_CHANNEL_0;
+constexpr adc_atten_t k_battery_adc_atten = ADC_ATTEN_DB_12;
+constexpr adc_bitwidth_t k_battery_adc_width = ADC_BITWIDTH_12;
+constexpr uint8_t k_battery_samples_per_read = 16;
+constexpr TickType_t k_battery_sample_period_ticks = pdMS_TO_TICKS(5000);
+constexpr uint32_t k_battery_empty_mv = 9000;
+constexpr uint32_t k_battery_full_mv = 12600;
+constexpr uint32_t k_battery_max_valid_mv = 14000;
+constexpr uint32_t k_battery_divider_numerator = 110;
+constexpr uint32_t k_battery_divider_denominator = 10;
+
 enum class CalibState : uint8_t {
     IDLE,              // Normal operation
     READY,             // Calibration mode active, waiting for input
@@ -85,6 +102,12 @@ struct motor_state_t {
     bool moving;
 };
 
+struct battery_state_t {
+    uint32_t voltage_mv;
+    uint8_t percent;
+    bool valid;
+};
+
 // === SHARED WITH CALIBRATION MODULE ===
 SemaphoreHandle_t s_state_lock = nullptr;
 motor_state_t s_state = {};
@@ -93,8 +116,13 @@ CalibState s_calib_state = CalibState::IDLE;
 // === MOTOR CONTROL STATE ===
 TaskHandle_t s_stepper_task = nullptr;
 TaskHandle_t s_update_task = nullptr;
+TaskHandle_t s_battery_task = nullptr;
 uint16_t s_endpoint_id = 0;
 std::atomic<bool> s_report_pending(false);
+battery_state_t s_battery_state = {};
+adc_oneshot_unit_handle_t s_battery_adc_handle = nullptr;
+adc_cali_handle_t s_battery_adc_cali_handle = nullptr;
+bool s_battery_adc_cali_enabled = false;
 
 // === CALIBRATION STATE ===
 TaskHandle_t s_button_task = nullptr;
@@ -310,6 +338,127 @@ void update_task(void *arg)
         }
 
         vTaskDelay(k_update_period_ticks);
+    }
+}
+
+uint8_t battery_percent_from_mv(uint32_t voltage_mv)
+{
+    if (voltage_mv <= k_battery_empty_mv) {
+        return 0;
+    }
+    if (voltage_mv >= k_battery_full_mv) {
+        return 100;
+    }
+    uint32_t scaled = (voltage_mv - k_battery_empty_mv) * 100 + ((k_battery_full_mv - k_battery_empty_mv) / 2);
+    return static_cast<uint8_t>(scaled / (k_battery_full_mv - k_battery_empty_mv));
+}
+
+bool read_battery_voltage_mv(uint32_t &battery_mv_out)
+{
+    if (!s_battery_adc_handle) {
+        return false;
+    }
+
+    int raw = 0;
+    uint32_t raw_sum = 0;
+    for (uint8_t i = 0; i < k_battery_samples_per_read; ++i) {
+        esp_err_t err = adc_oneshot_read(s_battery_adc_handle, k_battery_adc_channel, &raw);
+        if (err != ESP_OK) {
+            BS_LOG_ERROR("Battery ADC read failed: %d", err);
+            return false;
+        }
+        raw_sum += static_cast<uint32_t>(raw);
+    }
+
+    int avg_raw = static_cast<int>(raw_sum / k_battery_samples_per_read);
+    int pin_mv = 0;
+    if (s_battery_adc_cali_enabled) {
+        esp_err_t err = adc_cali_raw_to_voltage(s_battery_adc_cali_handle, avg_raw, &pin_mv);
+        if (err != ESP_OK) {
+            BS_LOG_ERROR("Battery ADC calibration convert failed: %d", err);
+            return false;
+        }
+    } else {
+        pin_mv = (avg_raw * 3300) / 4095;
+    }
+
+    uint32_t batt_mv = (static_cast<uint32_t>(pin_mv) * k_battery_divider_numerator + (k_battery_divider_denominator / 2)) /
+                       k_battery_divider_denominator;
+    if (batt_mv > k_battery_max_valid_mv) {
+        BS_LOG_ERROR("Battery ADC out of range: %u mV", static_cast<unsigned>(batt_mv));
+        return false;
+    }
+
+    battery_mv_out = batt_mv;
+    return true;
+}
+
+esp_err_t init_battery_adc()
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {};
+    unit_cfg.unit_id = k_battery_adc_unit;
+    unit_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
+    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &s_battery_adc_handle);
+    if (err != ESP_OK) {
+        BS_LOG_ERROR("Battery ADC unit init failed: %d", err);
+        return err;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {};
+    chan_cfg.atten = k_battery_adc_atten;
+    chan_cfg.bitwidth = k_battery_adc_width;
+    err = adc_oneshot_config_channel(s_battery_adc_handle, k_battery_adc_channel, &chan_cfg);
+    if (err != ESP_OK) {
+        BS_LOG_ERROR("Battery ADC channel config failed: %d", err);
+        return err;
+    }
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_cfg = {};
+    cali_cfg.unit_id = k_battery_adc_unit;
+    cali_cfg.chan = k_battery_adc_channel;
+    cali_cfg.atten = k_battery_adc_atten;
+    cali_cfg.bitwidth = k_battery_adc_width;
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_battery_adc_cali_handle) == ESP_OK) {
+        s_battery_adc_cali_enabled = true;
+    }
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    adc_cali_line_fitting_config_t cali_cfg = {};
+    cali_cfg.unit_id = k_battery_adc_unit;
+    cali_cfg.atten = k_battery_adc_atten;
+    cali_cfg.bitwidth = k_battery_adc_width;
+    if (adc_cali_create_scheme_line_fitting(&cali_cfg, &s_battery_adc_cali_handle) == ESP_OK) {
+        s_battery_adc_cali_enabled = true;
+    }
+#endif
+
+    BS_LOG_STATE("Battery ADC ready: GPIO%u ch=%u cali=%s", static_cast<unsigned>(k_battery_adc_gpio),
+                 static_cast<unsigned>(k_battery_adc_channel), s_battery_adc_cali_enabled ? "yes" : "no");
+    return ESP_OK;
+}
+
+void battery_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        uint32_t measured_mv = 0;
+        bool valid_read = read_battery_voltage_mv(measured_mv);
+
+        if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+            if (valid_read) {
+                if (s_battery_state.valid) {
+                    measured_mv = (s_battery_state.voltage_mv * 3 + measured_mv) / 4;
+                }
+                s_battery_state.voltage_mv = measured_mv;
+                s_battery_state.percent = battery_percent_from_mv(measured_mv);
+                s_battery_state.valid = true;
+            } else {
+                s_battery_state.valid = false;
+            }
+            xSemaphoreGive(s_state_lock);
+        }
+
+        vTaskDelay(k_battery_sample_period_ticks);
     }
 }
 
@@ -642,6 +791,17 @@ esp_err_t app_driver_init(uint16_t endpoint_id)
     gpio_set_level(BS_PIN_DIR, 1);
     gpio_set_level(BS_PIN_EN, 1);
 
+    gpio_config_t battery_cfg = {};
+    battery_cfg.pin_bit_mask = (1ULL << k_battery_adc_gpio);
+    battery_cfg.mode = GPIO_MODE_INPUT;
+    battery_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
+    battery_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    err = gpio_config(&battery_cfg);
+    if (err != ESP_OK) {
+        BS_LOG_ERROR("Failed to init battery ADC GPIO: %d", err);
+        return err;
+    }
+
     // === INIT CALIBRATION HARDWARE ===
     gpio_config_t btn_cfg = {};
     btn_cfg.pin_bit_mask = (1ULL << k_btn_up) | (1ULL << k_btn_stop) | (1ULL << k_btn_down);
@@ -679,6 +839,14 @@ esp_err_t app_driver_init(uint16_t endpoint_id)
     s_state.target_steps = 0;
     s_state.moving_dir = 0;
     s_state.moving = false;
+    s_battery_state.voltage_mv = 0;
+    s_battery_state.percent = 0;
+    s_battery_state.valid = false;
+
+    err = init_battery_adc();
+    if (err != ESP_OK) {
+        return err;
+    }
 
     // Start LED task
     BaseType_t ok = xTaskCreate(led_task, "calib_led", 3072, nullptr, 1, &s_led_task);
@@ -703,6 +871,12 @@ esp_err_t app_driver_init(uint16_t endpoint_id)
     ok = xTaskCreate(update_task, "wc_update", 4096, nullptr, 1, &s_update_task);
     if (ok != pdPASS) {
         BS_LOG_ERROR("Failed to start update task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ok = xTaskCreate(battery_task, "battery_adc", 3072, nullptr, 1, &s_battery_task);
+    if (ok != pdPASS) {
+        BS_LOG_ERROR("Failed to start battery task");
         return ESP_ERR_NO_MEM;
     }
 
@@ -780,4 +954,21 @@ void app_driver_stop(uint16_t endpoint_id)
                  static_cast<unsigned>(s_state.current_steps));
 
     xSemaphoreGive(s_state_lock);
+}
+
+esp_err_t app_driver_get_battery_status(app_battery_status_t *status)
+{
+    if (!status || !s_state_lock) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    status->voltage_mv = s_battery_state.voltage_mv;
+    status->percent = s_battery_state.percent;
+    status->valid = s_battery_state.valid;
+
+    xSemaphoreGive(s_state_lock);
+    return ESP_OK;
 }

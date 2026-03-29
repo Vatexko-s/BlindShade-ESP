@@ -7,6 +7,10 @@
 */
 
 #include <atomic>
+#include <cstdio>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <esp_err.h>
 #include <nvs_flash.h>
@@ -43,12 +47,19 @@ using namespace chip::DeviceLayer;
 #endif
 
 uint16_t window_covering_endpoint_id = 0;
+uint16_t power_source_endpoint_id = 0;
 
 using namespace esp_matter;
 using namespace esp_matter::attribute;
 using namespace chip::app::Clusters;
 
 constexpr auto k_timeout_seconds = 300;
+constexpr TickType_t k_battery_report_period_ticks = pdMS_TO_TICKS(5000);
+static TaskHandle_t s_battery_report_task = nullptr;
+
+// Some ESP-Matter configs do not link the CHIP Power Source server plugin symbol.
+// Provide a weak fallback so power_source endpoint creation can still link.
+void __attribute__((weak)) MatterPowerSourcePluginServerInitCallback() {}
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
 extern const uint8_t cd_start[] asm("_binary_certification_declaration_der_start");
@@ -248,6 +259,41 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
     return err;
 }
 
+static void battery_report_work(intptr_t arg)
+{
+    (void)arg;
+    if (power_source_endpoint_id == 0) {
+        return;
+    }
+
+    app_battery_status_t status = {};
+    if (app_driver_get_battery_status(&status) != ESP_OK || !status.valid) {
+        return;
+    }
+
+    esp_matter_attr_val_t voltage_val = esp_matter_nullable_uint32(status.voltage_mv);
+    attribute::update(power_source_endpoint_id, PowerSource::Id, PowerSource::Attributes::BatVoltage::Id, &voltage_val);
+
+    uint16_t matter_percent = static_cast<uint16_t>(status.percent) * 2; // 0.5% units
+    if (matter_percent > 200) {
+        matter_percent = 200;
+    }
+    esp_matter_attr_val_t percent_val = esp_matter_nullable_uint8(static_cast<uint8_t>(matter_percent));
+    attribute::update(power_source_endpoint_id, PowerSource::Id, PowerSource::Attributes::BatPercentRemaining::Id, &percent_val);
+}
+
+static void battery_report_task(void *arg)
+{
+    (void)arg;
+    while (true) {
+        CHIP_ERROR err = chip::DeviceLayer::PlatformMgr().ScheduleWork(battery_report_work, 0);
+        if (err != CHIP_NO_ERROR) {
+            BS_LOG_WARN("Battery report schedule failed: %" CHIP_ERROR_FORMAT, err.Format());
+        }
+        vTaskDelay(k_battery_report_period_ticks);
+    }
+}
+
 extern "C" void app_main()
 {
     esp_err_t err = ESP_OK;
@@ -292,6 +338,30 @@ extern "C" void app_main()
     command::set_user_callback(command::get(wc_cluster, WindowCovering::Commands::GoToLiftPercentage::Id, COMMAND_FLAG_ACCEPTED),
                                app_window_covering_command_pre_cb);
 
+    esp_matter::endpoint::power_source::config_t power_source_config;
+    power_source_config.power_source.feature_flags = esp_matter::cluster::power_source::feature::battery::get_id();
+    power_source_config.power_source.status = static_cast<uint8_t>(chip::app::Clusters::PowerSource::PowerSourceStatusEnum::kActive);
+    snprintf(power_source_config.power_source.description, sizeof(power_source_config.power_source.description), "3S Battery");
+    power_source_config.power_source.features.battery.bat_charge_level =
+        static_cast<uint8_t>(chip::app::Clusters::PowerSource::BatChargeLevelEnum::kOk);
+    power_source_config.power_source.features.battery.bat_replacement_needed = false;
+    power_source_config.power_source.features.battery.bat_replaceability =
+        static_cast<uint8_t>(chip::app::Clusters::PowerSource::BatReplaceabilityEnum::kNotReplaceable);
+
+    endpoint_t *power_source_endpoint =
+        endpoint::power_source::create(node, &power_source_config, ENDPOINT_FLAG_NONE, nullptr);
+    ABORT_APP_ON_FAILURE(power_source_endpoint != nullptr, BS_LOG_ERROR("Failed to create power source endpoint"));
+    power_source_endpoint_id = endpoint::get_id(power_source_endpoint);
+    BS_LOG_STATE("Power source created with endpoint_id %d", power_source_endpoint_id);
+
+    cluster_t *ps_cluster = cluster::get(power_source_endpoint_id, PowerSource::Id);
+    ABORT_APP_ON_FAILURE(ps_cluster != nullptr, BS_LOG_ERROR("Failed to get power source cluster"));
+    cluster::power_source::attribute::create_bat_voltage(ps_cluster, nullable<uint32_t>(0), nullable<uint32_t>(0),
+                                                         nullable<uint32_t>(20000));
+    cluster::power_source::attribute::create_bat_percent_remaining(ps_cluster, nullable<uint8_t>(0), nullable<uint8_t>(0),
+                                                                   nullable<uint8_t>(200));
+    cluster::power_source::attribute::create_bat_present(ps_cluster, true);
+
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD && CHIP_DEVICE_CONFIG_ENABLE_WIFI_STATION
     // Enable secondary network interface
     secondary_network_interface::config_t secondary_network_interface_config;
@@ -326,6 +396,9 @@ extern "C" void app_main()
 
     err = app_driver_init(window_covering_endpoint_id);
     ABORT_APP_ON_FAILURE(err == ESP_OK, BS_LOG_ERROR("Failed to init motor driver, err:%d", err));
+
+    BaseType_t ok = xTaskCreate(battery_report_task, "battery_report", 3072, nullptr, 1, &s_battery_report_task);
+    ABORT_APP_ON_FAILURE(ok == pdPASS, BS_LOG_ERROR("Failed to start battery report task"));
 
 #if CONFIG_ENABLE_ENCRYPTED_OTA
     err = esp_matter_ota_requestor_encrypted_init(s_decryption_key, s_decryption_key_len);

@@ -9,8 +9,15 @@
 #pragma once
 
 #include <esp_err.h>
+#include <stdint.h>
 
 typedef void *app_driver_handle_t;
+
+typedef struct {
+    uint32_t voltage_mv;
+    uint8_t percent;
+    bool valid;
+} app_battery_status_t;
 
 /** Initialize the window covering dummy motor driver. */
 esp_err_t app_driver_init(uint16_t endpoint_id);
@@ -20,6 +27,9 @@ void app_driver_set_target_percent100ths(uint16_t endpoint_id, uint16_t target_p
 
 /** Stop motion immediately. */
 void app_driver_stop(uint16_t endpoint_id);
+
+/** Get latest battery measurement (GPIO0). */
+esp_err_t app_driver_get_battery_status(app_battery_status_t *status);
 
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
 #include "esp_openthread_types.h"
