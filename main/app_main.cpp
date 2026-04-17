@@ -56,6 +56,44 @@ using namespace chip::app::Clusters;
 constexpr auto k_timeout_seconds = 300;
 constexpr TickType_t k_battery_report_period_ticks = pdMS_TO_TICKS(5000);
 static TaskHandle_t s_battery_report_task = nullptr;
+static std::atomic<bool> s_commissioning_window_open(false);
+static std::atomic<bool> s_device_online(false);
+static std::atomic<bool> s_driver_ready(false);
+static std::atomic<bool> s_error_state(false);
+
+static void apply_led_state()
+{
+    if (!s_driver_ready.load()) {
+        return;
+    }
+
+    app_led_pattern_t pattern = {};
+    if (s_error_state.load()) {
+        pattern = {255, 0, 0, APP_LED_SOLID, 0}; // error red
+    } else if (app_driver_is_calibrating()) {
+        pattern = {255, 180, 0, APP_LED_BLINK, 600}; // calibration yellow blink
+    } else if (s_commissioning_window_open.load()) {
+        pattern = {0, 0, 255, APP_LED_BLINK, 500}; // pairing mode blue blink
+    } else {
+        app_battery_status_t battery = {};
+        if (app_driver_get_battery_status(&battery) == ESP_OK && battery.valid) {
+            if (battery.percent < 10) {
+                pattern = {255, 0, 0, APP_LED_SOLID, 0}; // critical battery
+            } else if (battery.percent < 40) {
+                pattern = {255, 128, 0, APP_LED_SOLID, 0}; // low battery orange
+            }
+        }
+        if (pattern.red == 0 && pattern.green == 0 && pattern.blue == 0) {
+            if (s_device_online.load()) {
+                pattern = {0, 255, 0, APP_LED_SOLID, 0}; // online green
+            } else {
+                pattern = {0, 255, 0, APP_LED_BLINK, 1200}; // offline alive: slow green pulse
+            }
+        }
+    }
+
+    app_driver_set_status_led(&pattern);
+}
 
 // Some ESP-Matter configs do not link the CHIP Power Source server plugin symbol.
 // Provide a weak fallback so power_source endpoint creation can still link.
@@ -81,32 +119,52 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
     switch (event->Type) {
     case chip::DeviceLayer::DeviceEventType::kInterfaceIpAddressChanged:
         BS_LOG_APP("Interface IP Address changed");
+        if (event->InterfaceIpAddressChanged.Type == chip::DeviceLayer::InterfaceIpChangeType::kIpV4_Assigned ||
+            event->InterfaceIpAddressChanged.Type == chip::DeviceLayer::InterfaceIpChangeType::kIpV6_Assigned) {
+            s_device_online.store(true);
+        } else {
+            s_device_online.store(false);
+        }
+        apply_led_state();
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
         BS_LOG_STATE("Commissioning complete");
+        s_commissioning_window_open.store(false);
+        s_device_online.store(true);
+        apply_led_state();
         MEMORY_PROFILER_DUMP_HEAP_STAT("commissioning complete");
         break;
 
     case chip::DeviceLayer::DeviceEventType::kFailSafeTimerExpired:
         BS_LOG_WARN("Commissioning failed, fail safe timer expired");
+        s_error_state.store(true);
+        apply_led_state();
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningSessionStarted:
         BS_LOG_APP("Commissioning session started");
+        s_commissioning_window_open.store(true);
+        apply_led_state();
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningSessionStopped:
         BS_LOG_APP("Commissioning session stopped");
+        s_commissioning_window_open.store(false);
+        apply_led_state();
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningWindowOpened:
         BS_LOG_APP("Commissioning window opened");
+        s_commissioning_window_open.store(true);
+        apply_led_state();
         MEMORY_PROFILER_DUMP_HEAP_STAT("commissioning window opened");
         break;
 
     case chip::DeviceLayer::DeviceEventType::kCommissioningWindowClosed:
         BS_LOG_APP("Commissioning window closed");
+        s_commissioning_window_open.store(false);
+        apply_led_state();
         break;
 
     case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
@@ -126,14 +184,19 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
                     if (err != CHIP_NO_ERROR)
                     {
                         BS_LOG_ERROR("Failed to open commissioning window, err:%" CHIP_ERROR_FORMAT, err.Format());
+                        s_error_state.store(true);
                     }
                 }
             }
+            s_commissioning_window_open.store(true);
+            apply_led_state();
         break;
         }
 
     case chip::DeviceLayer::DeviceEventType::kFabricWillBeRemoved:
         BS_LOG_APP("Fabric will be removed");
+        s_commissioning_window_open.store(true);
+        apply_led_state();
         break;
 
     case chip::DeviceLayer::DeviceEventType::kFabricUpdated:
@@ -146,6 +209,7 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
 
     case chip::DeviceLayer::DeviceEventType::kBLEDeinitialized:
         BS_LOG_APP("BLE deinitialized and memory reclaimed");
+        apply_led_state();
         MEMORY_PROFILER_DUMP_HEAP_STAT("BLE deinitialized");
         break;
 
@@ -268,6 +332,7 @@ static void battery_report_work(intptr_t arg)
 
     app_battery_status_t status = {};
     if (app_driver_get_battery_status(&status) != ESP_OK || !status.valid) {
+        apply_led_state();
         return;
     }
 
@@ -280,6 +345,7 @@ static void battery_report_work(intptr_t arg)
     }
     esp_matter_attr_val_t percent_val = esp_matter_nullable_uint8(static_cast<uint8_t>(matter_percent));
     attribute::update(power_source_endpoint_id, PowerSource::Id, PowerSource::Attributes::BatPercentRemaining::Id, &percent_val);
+    apply_led_state();
 }
 
 static void battery_report_task(void *arg)
@@ -396,6 +462,8 @@ extern "C" void app_main()
 
     err = app_driver_init(window_covering_endpoint_id);
     ABORT_APP_ON_FAILURE(err == ESP_OK, BS_LOG_ERROR("Failed to init motor driver, err:%d", err));
+    s_driver_ready.store(true);
+    apply_led_state();
 
     BaseType_t ok = xTaskCreate(battery_report_task, "battery_report", 3072, nullptr, 1, &s_battery_report_task);
     ABORT_APP_ON_FAILURE(ok == pdPASS, BS_LOG_ERROR("Failed to start battery report task"));

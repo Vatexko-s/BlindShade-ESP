@@ -19,6 +19,19 @@ typedef struct {
     bool valid;
 } app_battery_status_t;
 
+typedef enum {
+    APP_LED_SOLID = 0,
+    APP_LED_BLINK
+} app_led_mode_t;
+
+typedef struct {
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+    app_led_mode_t mode;
+    uint16_t period_ms;
+} app_led_pattern_t;
+
 /** Initialize the window covering dummy motor driver. */
 esp_err_t app_driver_init(uint16_t endpoint_id);
 
@@ -30,6 +43,15 @@ void app_driver_stop(uint16_t endpoint_id);
 
 /** Get latest battery measurement (GPIO0). */
 esp_err_t app_driver_get_battery_status(app_battery_status_t *status);
+
+/** Set status LED pattern. */
+esp_err_t app_driver_set_status_led(const app_led_pattern_t *pattern);
+
+/** Blink current status color quickly N times (one-shot). */
+esp_err_t app_driver_signal_quick_blink(uint8_t count);
+
+/** True when calibration mode is active. */
+bool app_driver_is_calibrating();
 
 #if CHIP_DEVICE_CONFIG_ENABLE_THREAD
 #include "esp_openthread_types.h"

@@ -14,11 +14,13 @@
 #include <freertos/task.h>
 
 #include <driver/gpio.h>
+#include <driver/rmt.h>
 #include <esp_adc/adc_cali.h>
 #include <esp_adc/adc_cali_scheme.h>
 #include <esp_adc/adc_oneshot.h>
 #include <esp_rom_sys.h>
 #include <esp_timer.h>
+#include <led_strip.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 
@@ -39,6 +41,8 @@ constexpr uint16_t k_percent_100ths_max = 10000;
 constexpr uint16_t k_max_steps = 5000;
 constexpr uint16_t k_step_pulse_us = 10;
 constexpr uint16_t k_step_delay_us = 2000;
+constexpr uint16_t k_step_delay_start_us = 4500;
+constexpr uint16_t k_step_ramp_steps = 250;
 constexpr TickType_t k_update_period_ticks = pdMS_TO_TICKS(100);
 constexpr TickType_t k_report_min_interval_ticks = pdMS_TO_TICKS(200);
 constexpr uint16_t k_report_every_steps = 50;
@@ -49,6 +53,9 @@ constexpr gpio_num_t k_btn_up = GPIO_NUM_1;
 constexpr gpio_num_t k_btn_stop = GPIO_NUM_2;
 constexpr gpio_num_t k_btn_down = GPIO_NUM_3;
 constexpr gpio_num_t k_led_calib = GPIO_NUM_7;
+constexpr uint8_t k_ws2812_boot_brightness = 96;
+constexpr uint16_t k_led_task_period_ms = 50;
+constexpr uint16_t k_led_quick_blink_period_ms = 120;
 
 // === CALIBRATION CONFIG ===
 constexpr uint32_t k_btn_debounce_ms = 50;
@@ -127,6 +134,7 @@ bool s_battery_adc_cali_enabled = false;
 // === CALIBRATION STATE ===
 TaskHandle_t s_button_task = nullptr;
 TaskHandle_t s_led_task = nullptr;
+led_strip_t *s_led_strip = nullptr;
 button_data_t s_btn_up_data = {};
 button_data_t s_btn_stop_data = {};
 button_data_t s_btn_down_data = {};
@@ -140,13 +148,49 @@ bool s_matter_blocked = false;
 std::atomic<uint8_t> s_led_blink_count(0);
 std::atomic<uint16_t> s_led_blink_period_ms(0);
 std::atomic<bool> s_led_continuous(false);
+app_led_pattern_t s_status_led = {255, 128, 0, APP_LED_BLINK, 600}; // boot: blinking orange
+app_led_pattern_t s_status_before_calib = {255, 128, 0, APP_LED_BLINK, 600};
+app_led_pattern_t s_status_after_blink = {255, 128, 0, APP_LED_BLINK, 600};
+bool s_restore_status_after_blink = false;
+uint8_t s_quick_blink_count = 0;
 
-static inline void step_once()
+void set_calib_led_rgb(uint8_t red, uint8_t green, uint8_t blue)
+{
+    if (s_led_strip) {
+        s_led_strip->set_pixel(s_led_strip, 0, red, green, blue);
+        s_led_strip->refresh(s_led_strip, 100);
+        return;
+    }
+
+    gpio_set_level(k_led_calib, (red || green || blue) ? 1 : 0);
+}
+
+void set_calib_led(bool enabled)
+{
+    if (enabled) {
+        set_calib_led_rgb(k_ws2812_boot_brightness, k_ws2812_boot_brightness, k_ws2812_boot_brightness);
+    } else {
+        set_calib_led_rgb(0, 0, 0);
+    }
+}
+
+static inline uint16_t step_delay_for_ramp(uint16_t ramp_progress)
+{
+    if (k_step_delay_start_us <= k_step_delay_us || k_step_ramp_steps == 0 || ramp_progress >= k_step_ramp_steps) {
+        return k_step_delay_us;
+    }
+
+    uint32_t delta = static_cast<uint32_t>(k_step_delay_start_us - k_step_delay_us);
+    uint32_t reduced = (delta * ramp_progress) / k_step_ramp_steps;
+    return static_cast<uint16_t>(k_step_delay_start_us - reduced);
+}
+
+static inline void step_once(uint16_t step_delay_us)
 {
     gpio_set_level(BS_PIN_STEP, 1);
     esp_rom_delay_us(k_step_pulse_us);
     gpio_set_level(BS_PIN_STEP, 0);
-    esp_rom_delay_us(k_step_delay_us);
+    esp_rom_delay_us(step_delay_us);
 }
 
 uint16_t clamp_percent100ths(uint16_t value)
@@ -205,6 +249,8 @@ void stepper_task(void *arg)
 {
     (void)arg;
     uint16_t since_yield = 0;
+    uint16_t ramp_progress = 0;
+    int8_t last_dir = 0;
     while (true) {
         if (!s_state_lock) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -224,13 +270,23 @@ void stepper_task(void *arg)
 
         if (!moving) {
             gpio_set_level(BS_PIN_EN, 1);
+            ramp_progress = 0;
+            last_dir = 0;
             vTaskDelay(10 / portTICK_PERIOD_MS);
             continue;
         }
 
+        if (dir != last_dir) {
+            ramp_progress = 0;
+            last_dir = dir;
+        }
+
         gpio_set_level(BS_PIN_EN, 0);
         gpio_set_level(BS_PIN_DIR, (dir > 0) ? 1 : 0);
-        step_once();
+        step_once(step_delay_for_ramp(ramp_progress));
+        if (ramp_progress < k_step_ramp_steps) {
+            ramp_progress++;
+        }
 
         if (xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
             vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -466,36 +522,71 @@ void battery_task(void *arg)
 void led_task(void *arg)
 {
     (void)arg;
+    bool phase_on = true;
+    TickType_t last_toggle = xTaskGetTickCount();
     while (true) {
-        if (s_led_continuous.load()) {
-            gpio_set_level(k_led_calib, 1);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        } else {
-            uint8_t count = s_led_blink_count.load();
-            uint16_t period = s_led_blink_period_ms.load();
-            
-            if (count > 0 && period > 0) {
-                for (uint8_t i = 0; i < count; i++) {
-                    gpio_set_level(k_led_calib, 1);
-                    vTaskDelay(pdMS_TO_TICKS(period / 2));
-                    gpio_set_level(k_led_calib, 0);
-                    vTaskDelay(pdMS_TO_TICKS(period / 2));
+        app_led_pattern_t status = {};
+        uint8_t quick_count = 0;
+
+        if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+            status = s_status_led;
+            quick_count = s_quick_blink_count;
+            xSemaphoreGive(s_state_lock);
+        }
+
+        uint16_t period_ms = status.period_ms > 0 ? status.period_ms : 600;
+        if (quick_count > 0) {
+            period_ms = k_led_quick_blink_period_ms;
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        TickType_t half_period_ticks = pdMS_TO_TICKS(period_ms / 2);
+        if (half_period_ticks == 0) {
+            half_period_ticks = 1;
+        }
+        if ((now - last_toggle) >= half_period_ticks) {
+            phase_on = !phase_on;
+            last_toggle = now;
+
+            if (quick_count > 0 && phase_on) {
+                if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+                    if (s_quick_blink_count > 0) {
+                        s_quick_blink_count--;
+                    }
+                    if (s_quick_blink_count == 0 && s_restore_status_after_blink) {
+                        s_status_led = s_status_after_blink;
+                        s_restore_status_after_blink = false;
+                    }
+                    xSemaphoreGive(s_state_lock);
                 }
-                s_led_blink_count.store(0);
-                s_led_blink_period_ms.store(0);
-            } else {
-                gpio_set_level(k_led_calib, 0);
-                vTaskDelay(pdMS_TO_TICKS(100));
             }
         }
+
+        bool blink_mode = (status.mode == APP_LED_BLINK) || (quick_count > 0);
+        if (blink_mode) {
+            if (phase_on) {
+                set_calib_led_rgb(status.red, status.green, status.blue);
+            } else {
+                set_calib_led_rgb(0, 0, 0);
+            }
+        } else {
+            set_calib_led_rgb(status.red, status.green, status.blue);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(k_led_task_period_ms));
     }
 }
 
 void set_led_blink(uint8_t count, uint16_t period_ms)
 {
+    (void)period_ms;
     s_led_continuous.store(false);
-    s_led_blink_count.store(count);
-    s_led_blink_period_ms.store(period_ms);
+    s_led_blink_count.store(0);
+    s_led_blink_period_ms.store(0);
+    if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+        s_quick_blink_count = count;
+        xSemaphoreGive(s_state_lock);
+    }
 }
 
 void set_led_continuous(bool enabled)
@@ -503,6 +594,10 @@ void set_led_continuous(bool enabled)
     s_led_continuous.store(enabled);
     s_led_blink_count.store(0);
     s_led_blink_period_ms.store(0);
+    if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+        s_quick_blink_count = 0;
+        xSemaphoreGive(s_state_lock);
+    }
 }
 
 // === BUTTON HELPERS ===
@@ -635,7 +730,13 @@ void handle_calibration_events()
     if (s_calib_state != CalibState::IDLE) {
         if (now - s_calib_last_activity_us > k_calib_timeout_ms * 1000) {
             BS_LOG_ERROR("⏱️  Calibration timeout!");
-            set_led_blink(10, 100);  // Fast error blinks
+            if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+                s_status_after_blink = s_status_before_calib;
+                s_status_led = {255, 0, 0, APP_LED_SOLID, 0};
+                s_restore_status_after_blink = true;
+                s_quick_blink_count = 3;
+                xSemaphoreGive(s_state_lock);
+            }
             s_calib_state = CalibState::IDLE;
             s_matter_blocked = false;
             return;
@@ -650,7 +751,11 @@ void handle_calibration_events()
                 s_calib_state = CalibState::READY;
                 s_calib_last_activity_us = now;
                 s_matter_blocked = true;
-                set_led_continuous(true);  // LED ON continuously
+                if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+                    s_status_before_calib = s_status_led;
+                    s_status_led = {255, 180, 0, APP_LED_BLINK, 600}; // yellow blink during calibration
+                    xSemaphoreGive(s_state_lock);
+                }
                 s_btn_stop_data.state = ButtonState::RELEASED;  // Reset to avoid re-trigger
             }
             break;
@@ -687,7 +792,7 @@ void handle_calibration_events()
                 
                 s_calib_state = CalibState::HOME_SET;
                 s_calib_last_activity_us = now;
-                set_led_blink(2, 200);  // 2 quick blinks
+                set_led_blink(5, 120);  // 5 quick blinks
                 
                 BS_LOG_STATE("💾 Saving home position (0) to NVS");
                 save_calibration_to_nvs();
@@ -731,7 +836,7 @@ void handle_calibration_events()
                     s_bottom_steps = travel;  // This is the total travel distance
                     s_calib_state = CalibState::COMPLETE;
                     s_calib_last_activity_us = now;
-                    set_led_blink(3, 200);  // 3 quick blinks
+                    set_led_blink(5, 120);  // 5 quick blinks
                     
                     BS_LOG_STATE("💾 Saving bottom position (%u) to NVS", travel);
                     save_calibration_to_nvs();
@@ -746,7 +851,10 @@ void handle_calibration_events()
                     BS_LOG_STATE("🏁 CALIBRATION COMPLETE - Exiting");
                     s_calib_state = CalibState::IDLE;
                     s_matter_blocked = false;
-                    set_led_blink(5, 150);  // 5 victory blinks
+                    if (xSemaphoreTake(s_state_lock, portMAX_DELAY) == pdTRUE) {
+                        s_status_led = s_status_before_calib;
+                        xSemaphoreGive(s_state_lock);
+                    }
                 } else {
                     s_last_stop_press_us = now;
                 }
@@ -814,15 +922,54 @@ esp_err_t app_driver_init(uint16_t endpoint_id)
         return err;
     }
     
-    gpio_config_t led_cfg = {};
-    led_cfg.pin_bit_mask = (1ULL << k_led_calib);
-    led_cfg.mode = GPIO_MODE_OUTPUT;
-    err = gpio_config(&led_cfg);
-    if (err != ESP_OK) {
-        BS_LOG_ERROR("Failed to init LED GPIO: %d", err);
-        return err;
+    const rmt_channel_t ws2812_channels[] = {
+        RMT_CHANNEL_0, RMT_CHANNEL_1, RMT_CHANNEL_2, RMT_CHANNEL_3
+    };
+
+    err = ESP_FAIL;
+    for (rmt_channel_t channel : ws2812_channels) {
+        rmt_config_t rmt_tx_config = RMT_DEFAULT_CONFIG_TX(k_led_calib, channel);
+        esp_err_t channel_err = rmt_config(&rmt_tx_config);
+        if (channel_err != ESP_OK) {
+            BS_LOG_WARN("WS2812 RMT cfg failed on ch%d: %d", static_cast<int>(channel), channel_err);
+            continue;
+        }
+
+        channel_err = rmt_driver_install(channel, 0, 0);
+        if (channel_err != ESP_OK) {
+            BS_LOG_WARN("WS2812 RMT driver install failed on ch%d: %d", static_cast<int>(channel), channel_err);
+            continue;
+        }
+
+        led_strip_config_t strip_config = LED_STRIP_DEFAULT_CONFIG(1, (led_strip_dev_t)channel);
+        s_led_strip = led_strip_new_rmt_ws2812(&strip_config);
+        if (s_led_strip != nullptr) {
+            err = ESP_OK;
+            BS_LOG_MOTOR("WS2812 using RMT channel %d", static_cast<int>(channel));
+            break;
+        }
+
+        rmt_driver_uninstall(channel);
+        BS_LOG_WARN("WS2812 driver alloc failed on ch%d", static_cast<int>(channel));
     }
-    gpio_set_level(k_led_calib, 0);  // LED OFF initially
+
+    if (err == ESP_OK && s_led_strip != nullptr) {
+        set_calib_led(false);
+        BS_LOG_MOTOR("WS2812 init OK on GPIO%u", static_cast<unsigned>(k_led_calib));
+    } else {
+        BS_LOG_WARN("WS2812 init failed (%d), fallback to GPIO LED output", err);
+        s_led_strip = nullptr;
+
+        gpio_config_t led_cfg = {};
+        led_cfg.pin_bit_mask = (1ULL << k_led_calib);
+        led_cfg.mode = GPIO_MODE_OUTPUT;
+        err = gpio_config(&led_cfg);
+        if (err != ESP_OK) {
+            BS_LOG_ERROR("Failed to init LED GPIO: %d", err);
+            return err;
+        }
+        gpio_set_level(k_led_calib, 0);  // LED OFF initially
+    }
     
     BS_LOG_MOTOR("🎛️  Calibration HW: UP=GPIO%u STOP=GPIO%u DOWN=GPIO%u LED=GPIO%u",
                  static_cast<unsigned>(k_btn_up),
@@ -884,7 +1031,8 @@ esp_err_t app_driver_init(uint16_t endpoint_id)
                  static_cast<unsigned>(BS_PIN_STEP),
                  static_cast<unsigned>(BS_PIN_DIR),
                  static_cast<unsigned>(BS_PIN_EN));
-    BS_LOG_MOTOR("Stepper: max_steps=%u, pulse=%uus, delay=%uus", k_max_steps, k_step_pulse_us, k_step_delay_us);
+    BS_LOG_MOTOR("Stepper: max_steps=%u, pulse=%uus, delay=%uus, start_delay=%uus, ramp_steps=%u",
+                 k_max_steps, k_step_pulse_us, k_step_delay_us, k_step_delay_start_us, k_step_ramp_steps);
 
     return ESP_OK;
 }
@@ -971,4 +1119,43 @@ esp_err_t app_driver_get_battery_status(app_battery_status_t *status)
 
     xSemaphoreGive(s_state_lock);
     return ESP_OK;
+}
+
+esp_err_t app_driver_set_status_led(const app_led_pattern_t *pattern)
+{
+    if (!pattern || !s_state_lock) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_status_led = *pattern;
+    xSemaphoreGive(s_state_lock);
+    return ESP_OK;
+}
+
+esp_err_t app_driver_signal_quick_blink(uint8_t count)
+{
+    if (!s_state_lock) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_quick_blink_count = count;
+    xSemaphoreGive(s_state_lock);
+    return ESP_OK;
+}
+
+bool app_driver_is_calibrating()
+{
+    if (!s_state_lock) {
+        return false;
+    }
+    if (xSemaphoreTake(s_state_lock, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    bool calibrating = (s_calib_state != CalibState::IDLE);
+    xSemaphoreGive(s_state_lock);
+    return calibrating;
 }
