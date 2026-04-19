@@ -954,8 +954,13 @@ esp_err_t app_driver_init(uint16_t endpoint_id)
     }
 
     if (err == ESP_OK && s_led_strip != nullptr) {
-        set_calib_led(false);
         BS_LOG_MOTOR("WS2812 init OK on GPIO%u", static_cast<unsigned>(k_led_calib));
+      ]  for (int i = 0; i < 6; i++) {
+            set_calib_led_rgb(255, 0, 0); vTaskDelay(pdMS_TO_TICKS(300));
+            set_calib_led_rgb(0, 255, 0); vTaskDelay(pdMS_TO_TICKS(300));
+            set_calib_led_rgb(0, 0, 255); vTaskDelay(pdMS_TO_TICKS(300));
+        }
+        set_calib_led(false);
     } else {
         BS_LOG_WARN("WS2812 init failed (%d), fallback to GPIO LED output", err);
         s_led_strip = nullptr;
